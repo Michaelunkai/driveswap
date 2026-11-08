@@ -50,6 +50,14 @@ Safety: stages 2-4 need the saved backup plan; stage 1 is refused once the drive
 ### Resumable by design
 Progress is checkpointed in `C:\DriveSwap\<L>\state.json`. **Run it again at any time — it skips every step that is already done** and continues with the next one (a half-finished copy resumes where it stopped; files already copied are not re-copied).
 
+## Install
+
+1. Download **`DriveSwap-Setup-1.1.0.exe`** from the [latest release](https://github.com/Michaelunkai/driveswap/releases/latest) and run it (it asks for Administrator rights).
+2. Open any terminal and type `driveswap e f` (the installer adds DriveSwap to your `PATH`), or use the *DriveSwap* Start-menu shortcut.
+3. Prefer no installer? Download the portable **`driveswap.exe`** from the same release and run it anywhere.
+
+Uninstall from *Settings → Apps* (it also removes the `PATH` entry).
+
 ## Usage
 
 ```powershell
