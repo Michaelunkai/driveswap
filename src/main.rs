@@ -492,7 +492,7 @@ fn copy_all(items: &[(Src, FileRec)], dst_root: &Path, vol: Option<&exfat::Vol>,
 
 // ───────────────────────────── stage 1: backup ─────────────────────────────
 fn stage_backup(c: &Ctx, s: &mut State) -> Result<(), String> {
-    say("\n[1/4] BACKUP  drive -> C: (corrupted files are skipped)");
+    say("\n[1/5] BACKUP  drive -> C: (corrupted files are skipped)");
     let t0 = Instant::now();
     fs::create_dir_all(c.data()).map_err(|e| e.to_string())?;
     if c.force_raw && fs::read_dir(c.root()).is_ok() {
@@ -569,7 +569,7 @@ fn dir_size_hint(p: &Path) -> u64 {
 
 // ───────────────────────────── stage 2: format ─────────────────────────────
 fn stage_format(c: &Ctx, s: &mut State) -> Result<(), String> {
-    say("\n[2/4] FORMAT  repair the drive");
+    say("\n[2/5] FORMAT  repair the drive");
     if !s.backup_done {
         return Err("refusing to format: backup is not complete".into());
     }
@@ -710,7 +710,7 @@ fn hash_file(p: &Path) -> io::Result<[u8; 32]> {
 }
 
 fn stage_restore(c: &Ctx, s: &mut State) -> Result<(), String> {
-    say("\n[3/4] RESTORE  C: -> drive, exactly as it was");
+    say("\n[4/5] RESTORE  C: -> drive, exactly as it was");
     if !s.format_done {
         return Err("format stage not complete".into());
     }
@@ -785,25 +785,56 @@ fn stage_restore(c: &Ctx, s: &mut State) -> Result<(), String> {
 }
 
 // ───────────────────────────── stage 4: cleanup ─────────────────────────────
-fn stage_cleanup(c: &Ctx, s: &State) -> Result<(), String> {
-    say("\n[4/4] CLEANUP  delete the backup from C:");
-    if !s.restore_done {
-        return Err("refusing to delete backup: restore not verified".into());
-    }
-    let before = free_space(Path::new("C:\\"));
-    let mut files: Vec<PathBuf> = Vec::new();
-    let mut dirs: Vec<(usize, PathBuf)> = Vec::new();
-    for e in walkdir::WalkDir::new(&c.work).into_iter().filter_map(|e| e.ok()) {
-        if e.file_type().is_dir() {
-            dirs.push((e.depth(), e.into_path()));
-        } else {
-            files.push(e.into_path());
+/// Delete a whole folder tree as fast as possible: 32 workers list folders AND delete files at the same
+/// time (no separate slow listing pass), then the empty folders go deepest-level-first, each level in parallel.
+fn delete_tree(root: &Path) {
+    let stack: Mutex<(Vec<(usize, PathBuf)>, usize)> = Mutex::new((vec![(0, root.to_path_buf())], 0));
+    let dirs: Mutex<Vec<(usize, PathBuf)>> = Mutex::new(Vec::new());
+    std::thread::scope(|sc| {
+        for _ in 0..32 {
+            sc.spawn(|| loop {
+                let job = {
+                    let mut g = stack.lock().unwrap();
+                    match g.0.pop() {
+                        Some(j) => {
+                            g.1 += 1;
+                            Some(j)
+                        }
+                        None => {
+                            if g.1 == 0 {
+                                return;
+                            }
+                            None
+                        }
+                    }
+                };
+                match job {
+                    None => std::thread::sleep(Duration::from_millis(1)),
+                    Some((d, p)) => {
+                        let mut subs: Vec<(usize, PathBuf)> = Vec::new();
+                        if let Ok(rd) = fs::read_dir(&p) {
+                            for e in rd.flatten() {
+                                match e.file_type() {
+                                    Ok(t) if t.is_dir() && !t.is_symlink() => subs.push((d + 1, e.path())),
+                                    _ => {
+                                        let q = e.path();
+                                        if fs::remove_file(&q).is_err() {
+                                            let _ = fs::remove_dir(&q);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        dirs.lock().unwrap().push((d, p));
+                        let mut g = stack.lock().unwrap();
+                        g.0.extend(subs);
+                        g.1 -= 1;
+                    }
+                }
+            });
         }
-    }
-    run_pool(files.len(), |i| {
-        let _ = fs::remove_file(&files[i]);
     });
-    // folders: deepest level first, each level in parallel
+    let mut dirs = dirs.into_inner().unwrap();
     dirs.sort_by_key(|d| std::cmp::Reverse(d.0));
     let mut k = 0;
     while k < dirs.len() {
@@ -818,17 +849,51 @@ fn stage_cleanup(c: &Ctx, s: &State) -> Result<(), String> {
         });
         k = e;
     }
-    let _ = fs::remove_dir_all(&c.work);
+    if root.exists() {
+        let _ = fs::remove_dir_all(root);
+    }
+}
+
+/// `s = None` means FORCED (user asked for stage 5 directly): no restore-verified check.
+fn stage_cleanup(c: &Ctx, s: Option<&State>) -> Result<(), String> {
+    say("\n[5/5] CLEANUP  delete the backup from C:");
+    if let Some(s) = s {
+        if !s.restore_done {
+            return Err("refusing to delete backup: restore not verified".into());
+        }
+    } else {
+        say("  FORCED: deleting the backup now without checking the restore");
+    }
+    let t0 = Instant::now();
+    let before = free_space(Path::new("C:\\"));
+    if c.work.exists() {
+        delete_tree(&c.work);
+    }
     let freed = free_space(Path::new("C:\\")).saturating_sub(before);
-    say(&format!("  deleted backup folder, freed {:.1} GB on C:", gb(freed)));
+    say(&format!("  deleted backup folder in {:.1}s, freed {:.1} GB on C:", t0.elapsed().as_secs_f64(), gb(freed)));
     Ok(())
+}
+
+/// How many files of the saved plan are missing/short in the backup folder.
+fn backup_missing(c: &Ctx, s: &State) -> usize {
+    let n = AtomicUsize::new(0);
+    run_pool(s.files.len(), |i| {
+        let r = &s.files[i];
+        match fs::metadata(c.data().join(&r.rel)) {
+            Ok(m) if m.len() == r.size => {}
+            _ => {
+                n.fetch_add(1, Relaxed);
+            }
+        }
+    });
+    n.load(Relaxed)
 }
 
 // ───────────────────────────── main ─────────────────────────────
 fn usage() {
     println!(
         "driveswap — back up a drive to C:, format+fix it, reinstall Ventoy, restore everything, free the space\n\n\
-         USAGE:  driveswap [DRIVE_LETTER ...] [options]\n  e.g.  driveswap e f   (does E: completely, then F: immediately after)\n\n\
+         USAGE:  driveswap [DRIVE_LETTER ...] [options]\n  e.g.  driveswap e f   (does E: completely, then F: immediately after)\n        driveswap 5 e  (FORCE-start at stage 1 backup, 2 format, 3 ventoy, 4 restore, 5 delete backup)\n\n\
          OPTIONS:\n  --yes          no 10-second countdown before the format\n  --verify       byte-hash verification after restore (slower)\n  \
          --raw          force the raw exFAT reader (use for unmountable drives)\n  --ventoy       always install Ventoy (default: only if the drive was Ventoy)\n  \
          --work DIR     backup folder (default C:\\DriveSwap\\<L>)\n  --stop-after S stop after stage S (backup|format|restore), for testing
@@ -853,6 +918,7 @@ fn real_main() -> Result<(), String> {
         return Ok(());
     }
     let mut letters: Vec<char> = Vec::new();
+    let mut from: u8 = 0;
     let mut work: Option<PathBuf> = None;
     let mut i = 0;
     while i < args.len() {
@@ -863,10 +929,19 @@ fn real_main() -> Result<(), String> {
         } else if a == "--stop-after" {
             i += 1;
         } else if !a.starts_with("--") {
-            // accepts: e  E  e:  E:\  — several in a row run one after the other
+            // accepts: e  E  e:  E:\  — several in a row run one after the other;
+            // a digit 1-5 anywhere = force-start at that stage
             for tok in a.split(|ch: char| ch == ',' || ch == ' ') {
                 let t = tok.trim();
                 if t.is_empty() {
+                    continue;
+                }
+                if t.len() == 1 && t.as_bytes()[0].is_ascii_digit() {
+                    let n = t.as_bytes()[0] - b'0';
+                    if !(1..=5).contains(&n) {
+                        return Err(format!("stage '{t}' must be 1-5 (1 backup, 2 format, 3 ventoy, 4 restore, 5 delete backup)"));
+                    }
+                    from = n;
                     continue;
                 }
                 let mut ch = t.chars();
@@ -909,14 +984,14 @@ fn real_main() -> Result<(), String> {
         }
     }
     if letters.len() == 1 {
-        return run_drive(letters[0], work, &args);
+        return run_drive(letters[0], work, &args, from);
     }
     say(&format!("driveswap: {} drives queued: {}", letters.len(), letters.iter().map(|l| format!("{l}:")).collect::<Vec<_>>().join(" -> ")));
     let tall = Instant::now();
     let mut results: Vec<(char, Result<(), String>)> = Vec::new();
     for (n, l) in letters.iter().enumerate() {
         say(&format!("\n================ drive {}: ({}/{}) ================", l, n + 1, letters.len()));
-        let r = run_drive(*l, None, &args);
+        let r = run_drive(*l, None, &args, from);
         if let Err(e) = &r {
             eprintln!("\nERROR on {l}: {e}\n  continuing with the next drive; re-run this drive later to resume it");
         }
@@ -940,7 +1015,7 @@ fn real_main() -> Result<(), String> {
     }
 }
 
-fn run_drive(letter: char, work: Option<PathBuf>, args: &[String]) -> Result<(), String> {
+fn run_drive(letter: char, work: Option<PathBuf>, args: &[String], from: u8) -> Result<(), String> {
     let has = |f: &str| args.iter().any(|a| a == f);
     let c = Ctx {
         letter,
@@ -961,6 +1036,15 @@ fn run_drive(letter: char, work: Option<PathBuf>, args: &[String]) -> Result<(),
         say("saved progress cleared");
         return Ok(());
     }
+    if from == 5 && !has("--status") {
+        // forced: straight to deleting the backup, as fast as possible
+        let t0 = Instant::now();
+        say(&format!("driveswap: drive {}: FORCED start at stage 5 (delete backup)", c.letter));
+        stage_cleanup(&c, None)?;
+        say(&format!("\nALL DONE in {:.1} min.", t0.elapsed().as_secs_f64() / 60.0));
+        return Ok(());
+    }
+    let have_state = c.state_path().exists();
     let mut s: State = match fs::read(c.state_path()) {
         Ok(b) => serde_json::from_slice(&b).map_err(|e| format!("corrupt state file {}: {e}", c.state_path().display()))?,
         Err(_) => drive_info(&c)?,
@@ -975,6 +1059,25 @@ fn run_drive(letter: char, work: Option<PathBuf>, args: &[String]) -> Result<(),
         );
         return Ok(());
     }
+    if from >= 1 {
+        say(&format!("driveswap: FORCED start at stage {from} ({})", ["", "backup", "format", "ventoy", "restore", "delete backup"][from as usize]));
+        if from >= 2 && (!have_state || s.files.is_empty()) {
+            return Err(format!("stage {from} needs the saved backup plan, but none was found in {} — start from stage 1", c.work.display()));
+        }
+        if from == 1 && s.format_done && !s.files.is_empty() {
+            return Err("the drive was already formatted; starting at stage 1 would scan the EMPTY drive and overwrite the saved plan. Use stage 2-5, or --reset if you really want to discard the saved plan".into());
+        }
+        if from == 2 {
+            let miss = backup_missing(&c, &s);
+            if miss > 0 {
+                return Err(format!("backup is incomplete ({miss} files missing in {}); refusing to format. Run stage 1 first", c.data().display()));
+            }
+        }
+        s.backup_done = from > 1;
+        s.format_done = from > 2;
+        s.ventoy_done = from > 3;
+        s.restore_done = false;
+    }
     let t0 = Instant::now();
     say(&format!("driveswap: drive {}: fs={} label='{}' cluster={} ventoy={}", c.letter, s.fs, s.label, s.cluster, s.ventoy));
     if !s.backup_done {
@@ -983,7 +1086,7 @@ fn run_drive(letter: char, work: Option<PathBuf>, args: &[String]) -> Result<(),
             return Ok(());
         }
     } else {
-        say("\n[1/4] BACKUP  already done — skipping");
+        say("\n[1/5] BACKUP  already done — skipping");
     }
     if !s.format_done {
         stage_format(&c, &mut s)?;
@@ -991,7 +1094,7 @@ fn run_drive(letter: char, work: Option<PathBuf>, args: &[String]) -> Result<(),
             return Ok(());
         }
     } else {
-        say("\n[2/4] FORMAT  already done — skipping");
+        say("\n[2/5] FORMAT  already done — skipping");
     }
     if !s.ventoy_done {
         if let Err(e) = stage_ventoy(&c, &mut s) {
@@ -1006,10 +1109,10 @@ fn run_drive(letter: char, work: Option<PathBuf>, args: &[String]) -> Result<(),
             return Ok(());
         }
     } else {
-        say("\n[3/4] RESTORE  already done — skipping");
+        say("\n[4/5] RESTORE  already done — skipping");
     }
     let skipped = s.skipped.clone();
-    stage_cleanup(&c, &s)?;
+    stage_cleanup(&c, Some(&s))?;
     say(&format!("\nALL DONE in {:.1} min. {} corrupted/unreadable items were left out.", t0.elapsed().as_secs_f64() / 60.0, skipped.len()));
     if !skipped.is_empty() {
         let log = PathBuf::from(format!("C:\\DriveSwap\\skipped_{}.txt", c.letter));

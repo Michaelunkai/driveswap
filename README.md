@@ -29,6 +29,24 @@ hardware allows, without losing a single healthy file.
 | **3 · Restore** | Copies everything back with the original **timestamps and attributes** (hidden / read-only / system), recreating empty folders too, then verifies size + time of every file (`--verify` adds a full BLAKE3 content check). |
 | **4 · Cleanup** | Deletes `C:\DriveSwap\<L>` completely, in parallel, and reports the space freed. Refuses unless the restore was verified. |
 
+### Force-start at any stage
+Put a number **1-5** before (or after) the drive letters and DriveSwap jumps straight to that stage:
+
+| # | Stage |
+|---|-------|
+| 1 | Backup the drive to `C:\DriveSwap\<L>\data` |
+| 2 | Format & fix the drive (refuses if the backup is incomplete) |
+| 3 | Install Ventoy |
+| 4 | Restore everything to the drive |
+| 5 | Delete the backup from `C:` and free the space (as fast as possible, parallel) |
+
+```powershell
+driveswap.exe 5 e        # delete the backup of E: right now
+driveswap.exe 4 e f      # restore E:, then F:
+driveswap.exe 3 e        # reinstall Ventoy, restore, delete backup
+```
+Safety: stages 2-4 need the saved backup plan; stage 1 is refused once the drive was already formatted (it would scan an empty drive).
+
 ### Resumable by design
 Progress is checkpointed in `C:\DriveSwap\<L>\state.json`. **Run it again at any time — it skips every step that is already done** and continues with the next one (a half-finished copy resumes where it stopped; files already copied are not re-copied).
 
