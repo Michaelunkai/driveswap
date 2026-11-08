@@ -35,8 +35,9 @@ Progress is checkpointed in `C:\DriveSwap\<L>\state.json`. **Run it again at any
 ## Usage
 
 ```powershell
-driveswap.exe            # asks for the drive letter (default E)
+driveswap.exe            # asks for the drive letter(s) (default E)
 driveswap.exe E          # do everything for drive E:
+driveswap.exe E F G      # several drives: E completely, then F immediately, then G
 driveswap.exe E --yes    # no 10-second pause before formatting
 driveswap.exe E --verify # byte-level BLAKE3 verification after restore
 driveswap.exe E --raw    # force the raw exFAT reader (unmountable drive)
