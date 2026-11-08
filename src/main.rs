@@ -542,14 +542,22 @@ fn stage_format(c: &Ctx, s: &mut State) -> Result<(), String> {
     let l = c.letter;
     let r = ps(&format!("$ErrorActionPreference='Stop'; Format-Volume -DriveLetter {l} -FileSystem {fsn} -NewFileSystemLabel '{label}'{alloc} -Force -Confirm:$false | Out-Null"));
     if let Err(e) = r {
-        say(&format!("  Format-Volume failed ({}), trying format.com", e.lines().next().unwrap_or("")));
-        let a = if s.cluster > 0 { format!(" /A:{}", s.cluster) } else { String::new() };
-        let o = Command::new("cmd")
-            .args(["/c", &format!("format {l}: /FS:{fsn} /Q /Y /V:{}{a}", s.label)])
-            .output()
-            .map_err(|e| e.to_string())?;
-        if !o.status.success() {
-            return Err(format!("format failed: {}", String::from_utf8_lossy(&o.stdout)));
+        say(&format!("  Format-Volume failed ({}), trying diskpart", e.lines().next().unwrap_or("").trim()));
+        let unit = if s.cluster >= 1024 { format!(" unit={}k", s.cluster / 1024) } else { String::new() };
+        let script = c.work.join("format.dp");
+        let _ = fs::create_dir_all(&c.work);
+        fs::write(&script, format!("select volume {l}
+format fs={} label=\"{}\"{unit} quick override
+", fsn.to_lowercase(), s.label)).map_err(|e| e.to_string())?;
+        let o = Command::new("diskpart").arg("/s").arg(&script).output().map_err(|e| e.to_string())?;
+        let out = String::from_utf8_lossy(&o.stdout).to_string();
+        if !out.contains("successfully formatted") && !wait_mounted(c, 10).is_ok() {
+            say(&format!("  diskpart failed ({}), trying format.com", out.trim().lines().last().unwrap_or("")));
+            let a = if s.cluster >= 1024 { format!(" /A:{}K", s.cluster / 1024) } else { String::new() };
+            let o = Command::new("cmd").args(["/c", &format!("echo.| format {l}: /FS:{fsn} /Q /Y /V:{}{a}", s.label)]).output().map_err(|e| e.to_string())?;
+            if !o.status.success() {
+                return Err(format!("format failed: {}", String::from_utf8_lossy(&o.stdout)));
+            }
         }
     }
     wait_mounted(c, 30)?;
@@ -727,7 +735,7 @@ fn stage_cleanup(c: &Ctx, s: &State) -> Result<(), String> {
 fn usage() {
     println!(
         "driveswap — back up a drive to C:, format+fix it, reinstall Ventoy, restore everything, free the space\n\n\
-         USAGE:  driveswap [DRIVE_LETTER] [options]\n\n\
+         USAGE:  driveswap [DRIVE_LETTER ...] [options]\n  e.g.  driveswap e f   (does E: completely, then F: immediately after)\n\n\
          OPTIONS:\n  --yes          no 10-second countdown before the format\n  --verify       byte-hash verification after restore (slower)\n  \
          --raw          force the raw exFAT reader (use for unmountable drives)\n  --ventoy       always install Ventoy (default: only if the drive was Ventoy)\n  \
          --work DIR     backup folder (default C:\\DriveSwap\\<L>)\n  --stop-after S stop after stage S (backup|format|restore), for testing
@@ -742,7 +750,6 @@ fn real_main() -> Result<(), String> {
         usage();
         return Ok(());
     }
-    let has = |f: &str| args.iter().any(|a| a == f);
     if !is_admin() {
         say("Administrator rights needed — relaunching elevated...");
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
@@ -752,7 +759,7 @@ fn real_main() -> Result<(), String> {
         ps(&script)?;
         return Ok(());
     }
-    let mut letter: Option<char> = None;
+    let mut letters: Vec<char> = Vec::new();
     let mut work: Option<PathBuf> = None;
     let mut i = 0;
     while i < args.len() {
@@ -762,28 +769,86 @@ fn real_main() -> Result<(), String> {
             work = args.get(i).map(PathBuf::from);
         } else if a == "--stop-after" {
             i += 1;
-        } else if !a.starts_with("--") && letter.is_none() {
-            letter = a.chars().next().map(|c| c.to_ascii_uppercase());
+        } else if !a.starts_with("--") {
+            // accepts: e  E  e:  E:\  — several in a row run one after the other
+            for tok in a.split(|ch: char| ch == ',' || ch == ' ') {
+                let t = tok.trim();
+                if t.is_empty() {
+                    continue;
+                }
+                let mut ch = t.chars();
+                let l = ch.next().unwrap().to_ascii_uppercase();
+                let rest: String = ch.collect();
+                if !l.is_ascii_alphabetic() || !(rest.is_empty() || rest == ":" || rest == ":\\" || rest == ":/") {
+                    return Err(format!("'{t}' is not a drive letter"));
+                }
+                if !letters.contains(&l) {
+                    letters.push(l);
+                }
+            }
         }
         i += 1;
     }
-    let letter = match letter {
-        Some(l) => l,
-        None => {
-            print!("Drive letter to process [E]: ");
-            let _ = io::stdout().flush();
-            let mut s = String::new();
-            let _ = io::stdin().read_line(&mut s);
-            s.trim().chars().next().map(|c| c.to_ascii_uppercase()).unwrap_or('E')
+    if letters.is_empty() {
+        print!("Drive letter(s) to process, e.g. E or E F [E]: ");
+        let _ = io::stdout().flush();
+        let mut s = String::new();
+        let _ = io::stdin().read_line(&mut s);
+        for tok in s.split(|ch: char| ch == ',' || ch.is_whitespace()) {
+            if let Some(l) = tok.trim().chars().next() {
+                let l = l.to_ascii_uppercase();
+                if l.is_ascii_alphabetic() && !letters.contains(&l) {
+                    letters.push(l);
+                }
+            }
         }
-    };
-    if !letter.is_ascii_alphabetic() {
-        return Err("invalid drive letter".into());
+        if letters.is_empty() {
+            letters.push('E');
+        }
+    }
+    if letters.len() > 1 && work.is_some() {
+        return Err("--work can only be used with a single drive".into());
     }
     let sysdrive = std::env::var("SystemDrive").unwrap_or("C:".into()).chars().next().unwrap_or('C');
-    if letter == sysdrive.to_ascii_uppercase() || letter == 'C' {
-        return Err("refusing to operate on the system drive".into());
+    for l in &letters {
+        if *l == sysdrive.to_ascii_uppercase() || *l == 'C' {
+            return Err("refusing to operate on the system drive".into());
+        }
     }
+    if letters.len() == 1 {
+        return run_drive(letters[0], work, &args);
+    }
+    say(&format!("driveswap: {} drives queued: {}", letters.len(), letters.iter().map(|l| format!("{l}:")).collect::<Vec<_>>().join(" -> ")));
+    let tall = Instant::now();
+    let mut results: Vec<(char, Result<(), String>)> = Vec::new();
+    for (n, l) in letters.iter().enumerate() {
+        say(&format!("\n================ drive {}: ({}/{}) ================", l, n + 1, letters.len()));
+        let r = run_drive(*l, None, &args);
+        if let Err(e) = &r {
+            eprintln!("\nERROR on {l}: {e}\n  continuing with the next drive; re-run this drive later to resume it");
+        }
+        results.push((*l, r));
+    }
+    say(&format!("\n================ QUEUE FINISHED in {:.1} min ================", tall.elapsed().as_secs_f64() / 60.0));
+    let mut bad = 0;
+    for (l, r) in &results {
+        match r {
+            Ok(()) => say(&format!("  {l}:  OK")),
+            Err(e) => {
+                bad += 1;
+                say(&format!("  {l}:  FAILED - {e}"));
+            }
+        }
+    }
+    if bad > 0 {
+        Err(format!("{bad} of {} drives did not finish", results.len()))
+    } else {
+        Ok(())
+    }
+}
+
+fn run_drive(letter: char, work: Option<PathBuf>, args: &[String]) -> Result<(), String> {
+    let has = |f: &str| args.iter().any(|a| a == f);
     let c = Ctx {
         letter,
         work: work.unwrap_or_else(|| PathBuf::from(format!("C:\\DriveSwap\\{}", letter))),
