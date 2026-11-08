@@ -20,12 +20,33 @@ extern "system" {
     fn CreateFileW(name: *const u16, access: u32, share: u32, sec: *mut u8, disp: u32, flags: u32, tmpl: *mut u8) -> isize;
     fn SetFileTime(h: isize, c: *const u64, a: *const u64, w: *const u64) -> i32;
     fn CloseHandle(h: isize) -> i32;
+    fn SetFileInformationByHandle(h: isize, class: i32, info: *const u8, size: u32) -> i32;
     fn GetDiskFreeSpaceExW(p: *const u16, avail: *mut u64, total: *mut u64, free: *mut u64) -> i32;
 }
 
 const THREADS: usize = 16;
 const CHUNK: usize = 16 * 1024 * 1024;
 const TMP_EXT: &str = ".dswp";
+/// Files up to this size are written straight to their final name (no temp file + rename):
+/// a half-written one has the wrong size, so a resume always redoes it.
+const SMALL: u64 = 8 << 20;
+
+/// Set last-write time and (optionally) attributes through an already-open handle: zero extra opens.
+fn set_basic(h: isize, secs: i64, ns: u32, attrs: u32) {
+    #[repr(C)]
+    struct Basic {
+        ct: i64,
+        at: i64,
+        wt: i64,
+        chg: i64,
+        attrs: u32,
+        pad: u32,
+    }
+    let ft = (((secs + 11_644_473_600) as u64) * 10_000_000 + (ns / 100) as u64) as i64;
+    let a = if attrs == u32::MAX { 0 } else if attrs & 0x27 == 0 { 0x80 } else { attrs & 0x27 };
+    let b = Basic { ct: 0, at: 0, wt: ft, chg: 0, attrs: a, pad: 0 };
+    unsafe { SetFileInformationByHandle(h, 0, &b as *const Basic as *const u8, 40) };
+}
 
 fn wide(p: &Path) -> Vec<u16> {
     use std::os::windows::ffi::OsStrExt;
@@ -345,16 +366,25 @@ fn tmp_of(p: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-fn copy_file(src: &Src, vol: Option<&exfat::Vol>, size: u64, dst: &Path, prog: &Prog) -> io::Result<()> {
-    let tmp = tmp_of(dst);
+fn copy_file(src: &Src, vol: Option<&exfat::Vol>, size: u64, dst: &Path, prog: &Prog, rec: &FileRec, apply_attrs: bool) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    let small = size <= SMALL;
+    let target = if small { dst.to_path_buf() } else { tmp_of(dst) };
     let r = (|| -> io::Result<()> {
-        let mut out = File::create(&tmp)?;
-        if size > 0 {
+        let mut out = match File::create(&target) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied && small => {
+                set_attrs(dst, 0x80);
+                File::create(&target)?
+            }
+            Err(e) => return Err(e),
+        };
+        if !small {
             let _ = out.set_len(size);
         }
-        let mut buf = vec![0u8; CHUNK];
         match src {
             Src::Path(p) => {
+                let mut buf = vec![0u8; (size as usize).min(CHUNK).max(1)];
                 let mut f = File::open(p)?;
                 let mut left = size;
                 while left > 0 {
@@ -366,6 +396,7 @@ fn copy_file(src: &Src, vol: Option<&exfat::Vol>, size: u64, dst: &Path, prog: &
                 }
             }
             Src::Raw { fc, nofat } => {
+                let mut buf = vec![0u8; CHUNK];
                 let v = vol.unwrap();
                 let cl = v.chain(*fc, size, *nofat).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                 let per = (CHUNK as u64 / v.csz).max(1) as usize;
@@ -387,15 +418,26 @@ fn copy_file(src: &Src, vol: Option<&exfat::Vol>, size: u64, dst: &Path, prog: &
             }
         }
         out.flush()?;
+        // time (+ attributes for small files) on the SAME handle: no reopen
+        set_basic(out.as_raw_handle() as isize, rec.mtime, rec.mtime_ns, if small && apply_attrs { rec.attrs } else { u32::MAX });
         Ok(())
     })();
     match r {
         Ok(()) => {
-            let _ = fs::remove_file(dst);
-            fs::rename(&tmp, dst)
+            if !small {
+                let _ = fs::remove_file(dst);
+                fs::rename(&target, dst)?;
+                if apply_attrs {
+                    set_attrs(dst, rec.attrs);
+                }
+            } else if apply_attrs && rec.attrs & 0x20 == 0 {
+                // closing a written file re-sets the Archive bit; clear it again where the original had none
+                set_attrs(dst, rec.attrs);
+            }
+            Ok(())
         }
         Err(e) => {
-            let _ = fs::remove_file(&tmp);
+            let _ = fs::remove_file(&target);
             Err(e)
         }
     }
@@ -412,24 +454,32 @@ fn copy_all(items: &[(Src, FileRec)], dst_root: &Path, vol: Option<&exfat::Vol>,
         let dst = dst_root.join(&rec.rel);
         if let Ok(md) = fs::metadata(&dst) {
             if md.len() == rec.size && md.is_file() {
-                if apply_attrs {
+                // already there (resume): only touch it if time/attributes are not already right
+                let (mt, _) = md.modified().map(unix_of).unwrap_or((0, 0));
+                let time_ok = (mt - rec.mtime).abs() <= 2;
+                let attr_ok = !apply_attrs || (md.file_attributes() & 0x27) == (rec.attrs & 0x27);
+                if !attr_ok {
                     set_attrs(&dst, rec.attrs);
                 }
-                set_mtime(&dst, rec.mtime, rec.mtime_ns);
+                if !time_ok {
+                    set_mtime(&dst, rec.mtime, rec.mtime_ns);
+                }
                 prog.bytes.fetch_add(rec.size, Relaxed);
                 prog.files.fetch_add(1, Relaxed);
                 return;
             }
         }
-        if let Some(parent) = dst.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        match copy_file(src, vol, rec.size, &dst, &prog) {
-            Ok(()) => {
-                if apply_attrs {
-                    set_attrs(&dst, rec.attrs);
+        let mut r = copy_file(src, vol, rec.size, &dst, &prog, rec, apply_attrs);
+        if r.is_err() {
+            // parent folder missing? create it and retry once
+            if let Some(parent) = dst.parent() {
+                if fs::create_dir_all(parent).is_ok() {
+                    r = copy_file(src, vol, rec.size, &dst, &prog, rec, apply_attrs);
                 }
-                set_mtime(&dst, rec.mtime, rec.mtime_ns);
+            }
+        }
+        match r {
+            Ok(()) => {
                 prog.files.fetch_add(1, Relaxed);
             }
             Err(e) => fails.lock().unwrap().push((i, e.to_string())),
@@ -688,22 +738,42 @@ fn stage_restore(c: &Ctx, s: &mut State) -> Result<(), String> {
         set_mtime(&p, d.mtime, d.mtime_ns);
     }
     say("  verifying restore...");
+    // one directory listing per folder (size + time come with the listing) instead of one open per file
+    let mut groups: std::collections::HashMap<&str, Vec<usize>> = std::collections::HashMap::new();
+    for (i, r) in s.files.iter().enumerate() {
+        let parent = r.rel.rsplit_once('\\').map(|x| x.0).unwrap_or("");
+        groups.entry(parent).or_default().push(i);
+    }
+    let groups: Vec<(&str, Vec<usize>)> = groups.into_iter().collect();
     let bad = Mutex::new(vec![]);
-    run_pool(s.files.len(), |i| {
-        let r = &s.files[i];
-        let dst = root.join(&r.rel);
-        let ok = match fs::metadata(&dst) {
-            Ok(m) if m.len() == r.size => {
-                let (mt, _) = m.modified().map(unix_of).unwrap_or((0, 0));
-                (mt - r.mtime).abs() <= 2
+    run_pool(groups.len(), |g| {
+        let (parent, idxs) = &groups[g];
+        let mut have: std::collections::HashMap<String, (u64, i64)> = std::collections::HashMap::new();
+        if let Ok(rd) = fs::read_dir(root.join(parent)) {
+            for e in rd.flatten() {
+                if let Ok(m) = e.metadata() {
+                    let (mt, _) = m.modified().map(unix_of).unwrap_or((0, 0));
+                    have.insert(e.file_name().to_string_lossy().to_lowercase(), (m.len(), mt));
+                }
             }
-            _ => false,
-        };
-        let ok = ok && (!c.verify || r.size == 0 || hash_file(&dst).ok() == hash_file(&c.data().join(&r.rel)).ok());
-        if !ok {
-            bad.lock().unwrap().push(r.rel.clone());
+        }
+        for &i in idxs {
+            let r = &s.files[i];
+            let name = r.rel.rsplit_once('\\').map(|x| x.1).unwrap_or(&r.rel).to_lowercase();
+            let ok = matches!(have.get(&name), Some(&(len, mt)) if len == r.size && (mt - r.mtime).abs() <= 2);
+            if !ok {
+                bad.lock().unwrap().push(r.rel.clone());
+            }
         }
     });
+    if c.verify {
+        run_pool(s.files.len(), |i| {
+            let r = &s.files[i];
+            if r.size > 0 && hash_file(&root.join(&r.rel)).ok() != hash_file(&c.data().join(&r.rel)).ok() {
+                bad.lock().unwrap().push(r.rel.clone());
+            }
+        });
+    }
     let bad = bad.into_inner().unwrap();
     if !bad.is_empty() {
         return Err(format!("restore verification failed for {} files, e.g. {}", bad.len(), bad[0]));
@@ -721,10 +791,33 @@ fn stage_cleanup(c: &Ctx, s: &State) -> Result<(), String> {
         return Err("refusing to delete backup: restore not verified".into());
     }
     let before = free_space(Path::new("C:\\"));
-    let all: Vec<PathBuf> = walkdir::WalkDir::new(&c.work).contents_first(true).into_iter().filter_map(|e| e.ok()).filter(|e| e.file_type().is_file()).map(|e| e.into_path()).collect();
-    run_pool(all.len(), |i| {
-        let _ = fs::remove_file(&all[i]);
+    let mut files: Vec<PathBuf> = Vec::new();
+    let mut dirs: Vec<(usize, PathBuf)> = Vec::new();
+    for e in walkdir::WalkDir::new(&c.work).into_iter().filter_map(|e| e.ok()) {
+        if e.file_type().is_dir() {
+            dirs.push((e.depth(), e.into_path()));
+        } else {
+            files.push(e.into_path());
+        }
+    }
+    run_pool(files.len(), |i| {
+        let _ = fs::remove_file(&files[i]);
     });
+    // folders: deepest level first, each level in parallel
+    dirs.sort_by_key(|d| std::cmp::Reverse(d.0));
+    let mut k = 0;
+    while k < dirs.len() {
+        let depth = dirs[k].0;
+        let mut e = k;
+        while e < dirs.len() && dirs[e].0 == depth {
+            e += 1;
+        }
+        let level = &dirs[k..e];
+        run_pool(level.len(), |i| {
+            let _ = fs::remove_dir(&level[i].1);
+        });
+        k = e;
+    }
     let _ = fs::remove_dir_all(&c.work);
     let freed = free_space(Path::new("C:\\")).saturating_sub(before);
     say(&format!("  deleted backup folder, freed {:.1} GB on C:", gb(freed)));
